@@ -1,0 +1,8 @@
+{
+  "name": "simple-limit-order-bot",
+  "version": "1.0.0",
+  "main": "index.ts",
+  "repository": "https://github.com/JamesBurnsBacon/MEV_Limit_Order_Flashbots",
+  "author": "James Burns, Flashbots",
+  "license": "UNLICENSED"
+}
