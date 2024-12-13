@@ -12,12 +12,14 @@ const FB_REPUTATION_PRIVATE_KEY = process.env.FB_REPUTATION_PRIVATE_KEY || Walle
 const provider = new JsonRpcProvider(RPC_URL)
 const executorWallet = new Wallet(EXECUTOR_KEY, provider)
 const authSigner = new Wallet(FB_REPUTATION_PRIVATE_KEY, provider)
-const mevshare = MevShareClient.useEthereumSepolia(authSigner) //test
-//const mevshare = MevShareClient.useEthereumMainnet(authSigner) //main
+//const mevshare = MevShareClient.useEthereumSepolia(authSigner) //test
+const mevshare = MevShareClient.useEthereumMainnet(authSigner) //main
 
 //create contract instances
-const UNISWAP_V2_ADDRESS = '0xeE567Fe1712Faf6149d80dA1E6934E354124CfE3'
-const UNISWAP_FACTORY_ADDRESS = '0xF62c03E08ada871A0bEb309762E260a7a6a880E6'
+const UNISWAP_V2_ADDRESS = '0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f' //mainnet
+const UNISWAP_FACTORY_ADDRESS = '0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D' //mainnet
+// const UNISWAP_V2_ADDRESS = '0xeE567Fe1712Faf6149d80dA1E6934E354124CfE3' //sepolia
+// const UNISWAP_FACTORY_ADDRESS = '0xF62c03E08ada871A0bEb309762E260a7a6a880E6' //sepolia
 const uniswapRouterContract = new Contract(UNISWAP_V2_ADDRESS, UNISWAP_V2_ABI, executorWallet) //to execute trades
 const uniswapFactoryContract = new Contract(UNISWAP_FACTORY_ADDRESS, UNISWAP_FACTORY_ABI, provider) //to find contract addr of pair we want to trade
 
@@ -27,10 +29,10 @@ const DISCOUNT_IN_BPS = 40n
 //try sending a backrun bundle for this many blocks:
 const BLOCKS_TO_TRY = 24
 //WETH:
-const SELL_TOKEN_ADDRESS = '0x7b79995e5f793A07Bc00c21412e50Ecae098E7f9' //token we want to sell
+const SELL_TOKEN_ADDRESS = '0x6A023CCd1ff6F2045C3309768eAd9E68F978f6e1' //mainnet. token we want to sell
 const SELL_TOKEN_AMOUNT = 100000000n //.1gwei to spend
 //numeraire stablecoin USDC:
-const BUY_TOKEN_ADDRESS = '0xf08A50178dfcDe18524640EA6618a1f965821715'
+const BUY_TOKEN_ADDRESS = '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48' //mainnet
 const BUY_TOKEN_AMOUNT_CUTOFF = SELL_TOKEN_AMOUNT * 3800n //buy when token price is 3800 USDC/WETH
 
 const TX_GAS_LIMIT = 400000
@@ -58,6 +60,55 @@ async function approveTokenToRouter( tokenAddress: string, routerAddress: string
     await tokenContract.approve(routerAddress, 2n**256n - 1n)
 }
 
+async function getBuyTokenAmountWithExtra() {
+    const resultCallResult = await uniswapRouterContract
+          .swapExactTokensForTokens
+          .staticCallResult(
+              SELL_TOKEN_AMOUNT,
+              1n,
+              [SELL_TOKEN_ADDRESS, BUY_TOKEN_ADDRESS],
+              executorWallet.address,
+              9999999999n
+          )
+    const normalOutputAmount = resultCallResult[0][1]
+    const extraOutputAmount = normalOutputAmount * (10000n + DISCOUNT_IN_BPS) / 10000n 
+    return extraOutputAmount     
+}
+
+async function getSignedBackrunTx( outputAmount: bigint, nonce: number) {
+    const backrunTx = await uniswapRouterContract.swapExactTokensForTokens.populateTransaction(SELL_TOKEN_AMOUNT, outputAmount, [SELL_TOKEN_ADDRESS, BUY_TOKEN_ADDRESS], executorWallet.address, 9999999999n)
+    const backrunTxFull = {
+        ...backrunTx,
+        chainId: 1,
+        maxFeePerGas: MAX_GAS_PRICE * GWEI,
+        maxPriorityFeePerGas: MAX_PRIORITY_FEE * GWEI,
+        gasLimit: TX_GAS_LIMIT,
+        nonce: nonce
+    }
+    return executorWallet.signTransaction(backrunTxFull)
+}
+
+async function backrunAttempt( currentBlockNumber: number, nonce: number, pendingTxHash: string) {
+    let outputAmount = await getBuyTokenAmountWithExtra()
+    if (outputAmount < BUY_TOKEN_AMOUNT_CUTOFF) {
+        console.log(`Even with extra amount, not enough BUY token: ${ outputAmount.toString() }. Setting to amount cut-off`)
+        outputAmount = BUY_TOKEN_AMOUNT_CUTOFF
+    }
+    const backrunSignedTx = await getSignedBackrunTx(outputAmount, nonce)
+    try {
+        const sendBundleResult = await mevshare.sendBundle({
+            inclusion: { block: currentBlockNumber + 1 },
+            body: [
+                { hash: pendingTxHash },
+                { tx: backrunSignedTx, canRevert: false }
+            ]
+        },)
+        console.log('Bundle Hash: ' + sendBundleResult.bundleHash)
+    } catch (e) {
+        console.log('err', e)
+    }
+} 
+
 async function main() {
     console.log("mev-share auth address: " + authSigner.address)
     console.log("executor address: " +  executorWallet.address)
@@ -69,6 +120,7 @@ async function main() {
     await approveTokenToRouter(SELL_TOKEN_ADDRESS, UNISWAP_V2_ADDRESS)
     //bot only executes one trade, get the nonce now
     const nonce = await executorWallet.getNonce("latest")
+    let recentPendingTxHashes: Array<{ txHash: string, blockNumber: number }> = []
 
     mevshare.on('transaction', async ( pendingTx: IPendingTransaction) => {
         if (!transactionIsRelatedToPair(pendingTx, PAIR_ADDRESS)) {
@@ -76,6 +128,18 @@ async function main() {
             return
         }
         console.log(`It's a match: ${ pendingTx.hash }`)
+        const currentBlockNumber = await provider.getBlockNumber()
+        backrunAttempt(currentBlockNumber, nonce, pendingTx.hash)
+        recentPendingTxHashes.push({ txHash: pendingTx.hash, blockNumber: currentBlockNumber })
+    })
+    provider.on('block', ( blockNumber ) => {
+        for (const recentPendingTxHash of recentPendingTxHashes) {
+            console.log(recentPendingTxHash)
+            backrunAttempt(blockNumber, nonce, recentPendingTxHash.txHash)
+        }
+        recentPendingTxHashes = recentPendingTxHashes.filter(( recentPendingTxHash ) => 
+            blockNumber > recentPendingTxHash.blockNumber + BLOCKS_TO_TRY)
     })
 }
 main()
+
